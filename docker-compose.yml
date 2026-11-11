@@ -1,0 +1,124 @@
+services:
+  # ----------------------------------------------------
+  # DATABASE (PostgreSQL + pg_trgm indices)
+  # ----------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: kaneo-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: kaneo_db
+      POSTGRES_USER: kaneo_user
+      POSTGRES_PASSWORD: kaneo_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - kaneo-network
+
+  # ----------------------------------------------------
+  # CACHING, SESSIONS & PUB/SUB REAL-TIME (Redis)
+  # ----------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: kaneo-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - kaneo-network
+
+  # ----------------------------------------------------
+  # OBJECT STORAGE (MinIO - S3 Compatible)
+  # ----------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: kaneo-minio
+    restart: always
+    ports:
+      - "9000:9000"       # API Port
+      - "9001:9001"       # Web Console Port
+    environment:
+      MINIO_ROOT_USER: kaneo_admin
+      MINIO_ROOT_PASSWORD: kaneo_s3_password
+    volumes:
+      - minio_data:/data
+    # Executa um script inline para provisionar automaticamente o bucket padrão 'kaneo-attachments'
+    entrypoint: >
+      /bin/sh -c "
+      minio server /data --console-address ':9001' &
+      MINIO_PID=$$!;
+      until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done;
+      mc alias set local http://localhost:9000 kaneo_admin kaneo_s3_password;
+      mc mb local/kaneo-attachments || true;
+      mc anonymous set public local/kaneo-attachments || true;
+      wait $$MINIO_PID
+      "
+    networks:
+      - kaneo-network
+
+  # ----------------------------------------------------
+  # BACKEND ENGINE (Node.js + Fastify + WebSockets + Redis Pub/Sub)
+  # ----------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kaneo-backend
+    restart: always
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgresql://kaneo_user:kaneo_password@postgres:5432/kaneo_db?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: kaneo_super_secret_jwt_token_2026_key
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: kaneo_admin
+      MINIO_SECRET_KEY: kaneo_s3_password
+      MINIO_BUCKET: kaneo-attachments
+    volumes:
+      - ./backend:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    networks:
+      - kaneo-network
+
+  # ----------------------------------------------------
+  # FRONTEND WORKSPACE (React 18 + TS + Tailwind CSS)
+  # ----------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: kaneo-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:4000
+      - REACT_APP_WS_URL=ws://localhost:4000
+    volumes:
+      - ./frontend:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - kaneo-network
+
+networks:
+  kaneo-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
